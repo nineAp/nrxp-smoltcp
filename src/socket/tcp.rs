@@ -353,21 +353,30 @@ impl DynamicSocketBuffer {
         self.read_allocated(0, data)
     }
 
-    /// Read without consuming, applying AQM. For the rx buffer only.
-    /// Returns 0 if the head of the queue has been waiting longer than
-    /// `max_age_ms` milliseconds.
+    /// Read without consuming. For the rx buffer only.
+    ///
+    /// This used to return 0 once the head of the queue had waited longer than
+    /// `max_age_ms`, meant as AQM. That cannot work on a byte stream: nothing may be
+    /// dropped, and refusing to read stops the very drain that would empty the
+    /// buffer. `head_enqueued_at` is only re-stamped on an empty buffer, so once a
+    /// busy buffer aged past the limit every later peek returned 0, the receive
+    /// window went to 0 and the flow stayed stuck for good. The age is now advisory
+    /// (see [`Self::head_age_ms`]) and the read is never withheld.
     pub fn peek_slice_with_aqm(
         &self,
         data: &mut [u8],
-        current_time: crate::time::Instant,
-        max_age_ms: u64,
+        _current_time: crate::time::Instant,
+        _max_age_ms: u64,
     ) -> usize {
-        if let Some(enqueued) = self.head_enqueued_at {
-            if !self.is_empty() && (current_time - enqueued).total_millis() > max_age_ms {
-                return 0;
-            }
-        }
         self.read_allocated(0, data)
+    }
+
+    /// How long the oldest byte has been in the buffer since it was last empty, in
+    /// milliseconds. Advisory only: it is not refreshed while the buffer stays busy.
+    pub fn head_age_ms(&self, current_time: crate::time::Instant) -> Option<u64> {
+        self.head_enqueued_at
+            .filter(|_| !self.is_empty())
+            .map(|t| (current_time - t).total_millis())
     }
 }
 
@@ -2812,8 +2821,11 @@ impl Socket {
         // 3. Exactly one delivery-rate sample per ACK, from the oldest packet:
         // rate = (all bytes delivered since it was sent) / (its send→now interval).
         if let Some((delivered_at_send, delivered_time_at_send, is_app_limited)) = oldest {
+            // No lower bound beyond 1 us: on a local virtual link (TUN) the ACK comes
+            // back in tens of microseconds, and a 1 ms floor discarded every sample,
+            // so BtlBw never left 0 and cwnd stayed at its 4*MSS floor.
             let interval_micros = (now - delivered_time_at_send).total_micros();
-            if interval_micros >= 1000 {
+            if interval_micros >= 1 {
                 let delivered_delta = self.delivered - delivered_at_send;
                 rate_sample.delivery_rate =
                     (delivered_delta as f64 / interval_micros as f64 * 1_000_000.0) as u64;
@@ -9543,5 +9555,41 @@ mod test {
         assert_eq!(rs.interval, Duration::from_millis(100));
         assert_eq!(s.packet_tracker.len(), 1);
         assert_eq!(s.delivered, 2000);
+    }
+
+    #[test]
+    fn test_peek_not_withheld_when_aqm_age_exceeded() {
+        let mut s = socket_established_with_buffer_sizes(64, 64);
+        s.set_aqm_max_age(50);
+        send!(
+            s,
+            time 0,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        // Far past the AQM age: the data must still be readable, else the flow wedges.
+        let mut buf = [0u8; 16];
+        let n = s.peek_slice(&mut buf, Instant::from_millis(10_000)).unwrap();
+        assert_eq!(&buf[..n], b"abcdef");
+        assert_eq!(s.recv_slice(&mut buf), Ok(6));
+    }
+
+    #[test]
+    fn test_ack_tracking_sub_millisecond_sample() {
+        let mut s = socket_established();
+        let mut p = sent_packet(1000, 1000, 0);
+        p.delivered_time_at_send = Instant::from_micros(1_000_000);
+        p.sent_at = p.delivered_time_at_send;
+        s.packet_tracker.push_back(p);
+
+        // ACK 100 us later, as on a local virtual link.
+        let rs = s.process_ack_tracking(Instant::from_micros(1_000_100), &ack_repr(2000, None));
+
+        assert_eq!(rs.delivery_rate, 10_000_000); // 1000 B / 100 us
+        assert_eq!(rs.interval, Duration::from_micros(100));
     }
 }
