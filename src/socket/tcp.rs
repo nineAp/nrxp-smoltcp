@@ -2400,7 +2400,9 @@ impl Socket {
 
         // Step 6: payload-less packets (bare ACKs).
         if payload_len == 0 {
-            if window_increased || self.ack_to_transmit() || self.window_to_update() {
+            // Other pending ACKs and window updates are left to dispatch(); only a
+            // freshly grown receive window (BDP-driven resize) calls for an immediate ACK.
+            if window_increased {
                 return Some(self.ack_reply(ip_repr, repr));
             }
             return None;
@@ -2479,7 +2481,12 @@ impl Socket {
         if self.pacing_timer > cx.now() {
             return false;
         }
+        self.seq_to_transmit_unpaced(cx)
+    }
 
+    /// Like `seq_to_transmit`, but ignoring the pacing gate: is there anything to send
+    /// once the pacing timer allows it?
+    fn seq_to_transmit_unpaced(&self, cx: &mut Context) -> bool {
         let ip_header_len = match self.tuple.unwrap().local.addr {
             #[cfg(feature = "proto-ipv4")]
             IpAddress::Ipv4(_) => crate::wire::IPV4_HEADER_LEN,
@@ -3089,7 +3096,10 @@ impl Socket {
         let ack = repr.ack_number;
         let win = repr.window_len;
 
-        if len > 0 {
+        // Zero-window probes and keep-alives are not real transmissions: sampling them
+        // would feed bogus RTT/delivery-rate data and push the pacing timer, so they
+        // bypass the tracking, as they do `post_emit_state_update` below.
+        if len > 0 && !is_zero_window_probe && !is_keep_alive {
             self.post_emit_tracking(cx.now(), seq, len);
         }
 
@@ -3162,7 +3172,14 @@ impl Socket {
                 (_, _) => PollAt::Ingress,
             };
 
-            let pacing_poll = PollAt::Time(self.pacing_timer);
+            // Pacing only matters while it is holding back something we want to send;
+            // a stale (past) pacing timer must not make the socket look permanently due.
+            let pacing_poll = if self.pacing_timer > cx.now() && self.seq_to_transmit_unpaced(cx)
+            {
+                PollAt::Time(self.pacing_timer)
+            } else {
+                PollAt::Ingress
+            };
 
             // Wait for the earliest of all pending events.
             *[
@@ -6529,8 +6546,11 @@ mod test {
             max_seg_size: Some(BASE_MSS),
             ..RECV_TEMPL
         }));
+        // Stay at the retransmit time: the clock must not run backwards past the
+        // pacing timer armed by the SYN retransmit.
         send!(
             s,
+            time 1050,
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
@@ -6541,6 +6561,7 @@ mod test {
         s.send_slice(b"abcdef").unwrap();
         recv!(
             s,
+            time 1050,
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
