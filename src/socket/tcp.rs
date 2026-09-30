@@ -2707,11 +2707,33 @@ impl Socket {
 
     // ─── process() helpers ─────────────────────────────────────────────────────────
 
-    /// Retire acknowledged packets from packet_tracker and build a rate sample:
-    /// cumulative ACK (pop_front) plus SACK (a two-phase retain).
+    /// Retire acknowledged packets from packet_tracker and build ONE delivery-rate
+    /// sample per ACK: cumulative ACK (pop_front) plus SACK (a two-phase retain).
     /// Updates `self.delivered` and `self.delivered_time`.
+    ///
+    /// The sample is taken from the OLDEST newly-delivered packet (smallest
+    /// `delivered_time_at_send`, i.e. the largest send→ACK interval). This is
+    /// deliberately more conservative than Linux `tcp_rate.c`, which samples the most
+    /// recently sent packet and guards against over-estimates with
+    /// `interval = max(send_elapsed, ack_elapsed)`; we have no send-elapsed term, so
+    /// the longest ack interval is used instead.
+    ///
+    /// The previous version kept the MAX per-packet instantaneous rate across all
+    /// packets acknowledged by one ACK. Under ACK aggregation — routine on Wi-Fi/LTE
+    /// and tunnelled paths, which is exactly this stack's use case — the newest acked
+    /// packet has a tiny interval, so its instantaneous rate spikes far above the real
+    /// bottleneck bandwidth. `MAX` latched onto that spike, the BtlBw max-filter held
+    /// the over-estimate for its whole window, BBR paced at `gain × over-estimate`, and
+    /// the pacing gate barely spaced packets — leaving a standing queue at the
+    /// bottleneck (bufferbloat). The oldest packet's interval averages over the whole
+    /// ACK window and is aggregation-resistant.
     fn process_ack_tracking(&mut self, now: Instant, repr: &TcpRepr) -> RateSample {
         let mut rate_sample = RateSample::default();
+
+        // Oldest newly-delivered packet this ACK: (delivered_at_send,
+        // delivered_time_at_send, is_app_limited). Copied out of the packets so it
+        // is not borrowed across the packet_tracker mutations below.
+        let mut oldest: Option<(u64, Instant, bool)> = None;
 
         // 1. Cumulative ACK: pop_front while ack >= seq + len.
         if let Some(ack_number) = repr.ack_number {
@@ -2727,16 +2749,12 @@ impl Socket {
                     self.delivered += packet.length as u64;
                     self.delivered_time = now;
 
-                    let interval_micros = (now - packet.delivered_time_at_send).total_micros();
-                    if interval_micros >= 1000 {
-                        let delivered_delta = self.delivered - packet.delivered_at_send;
-                        let current_rate =
-                            (delivered_delta as f64 / interval_micros as f64 * 1_000_000.0) as u64;
-                        if current_rate > rate_sample.delivery_rate {
-                            rate_sample.delivery_rate = current_rate;
-                            rate_sample.interval = Duration::from_micros(interval_micros);
-                            rate_sample.is_app_limited = packet.is_app_limited;
-                        }
+                    if oldest.is_none_or(|(_, t, _)| packet.delivered_time_at_send < t) {
+                        oldest = Some((
+                            packet.delivered_at_send,
+                            packet.delivered_time_at_send,
+                            packet.is_app_limited,
+                        ));
                     }
                 } else {
                     break;
@@ -2774,21 +2792,26 @@ impl Socket {
             true
         });
 
-        // Apply the SACK updates. self.delivered is advanced before
-        // delivered_delta is computed, matching the cumulative-ACK path above.
+        // Apply the SACK updates. self.delivered is advanced here, and the oldest
+        // newly-delivered packet may be one of the SACKed ones.
         for (length, delivered_at_send, delivered_time_at_send, is_app_limited) in sacked_stats {
             self.delivered += length;
             self.delivered_time = now;
+            if oldest.is_none_or(|(_, t, _)| delivered_time_at_send < t) {
+                oldest = Some((delivered_at_send, delivered_time_at_send, is_app_limited));
+            }
+        }
+
+        // 3. Exactly one delivery-rate sample per ACK, from the oldest packet:
+        // rate = (all bytes delivered since it was sent) / (its send→now interval).
+        if let Some((delivered_at_send, delivered_time_at_send, is_app_limited)) = oldest {
             let interval_micros = (now - delivered_time_at_send).total_micros();
             if interval_micros >= 1000 {
                 let delivered_delta = self.delivered - delivered_at_send;
-                let current_rate =
+                rate_sample.delivery_rate =
                     (delivered_delta as f64 / interval_micros as f64 * 1_000_000.0) as u64;
-                if current_rate > rate_sample.delivery_rate {
-                    rate_sample.delivery_rate = current_rate;
-                    rate_sample.interval = Duration::from_micros(interval_micros);
-                    rate_sample.is_app_limited = is_app_limited;
-                }
+                rate_sample.interval = Duration::from_micros(interval_micros);
+                rate_sample.is_app_limited = is_app_limited;
             }
         }
 
@@ -9431,5 +9454,73 @@ mod test {
         s.send_slice(b"def").unwrap();
         recv_nothing!(s);
         assert_eq!(s.state, State::Closed);
+    }
+
+    // =========================================================================================//
+    // Delivery-rate sampling
+    // =========================================================================================//
+
+    fn sent_packet(seq: i32, len: usize, delivered_time_at_send_ms: i64) -> SentPacket {
+        SentPacket {
+            seq_number: TcpSeqNumber(seq),
+            length: len,
+            sent_at: Instant::from_millis(delivered_time_at_send_ms),
+            delivered_at_send: 0,
+            delivered_time_at_send: Instant::from_millis(delivered_time_at_send_ms),
+            is_app_limited: false,
+        }
+    }
+
+    fn ack_repr(ack: i32, sack: Option<(u32, u32)>) -> TcpRepr<'static> {
+        TcpRepr {
+            src_port: REMOTE_PORT,
+            dst_port: LOCAL_PORT,
+            control: TcpControl::None,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(TcpSeqNumber(ack)),
+            window_len: 256,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [sack, None, None],
+            timestamp: None,
+            payload: &[],
+        }
+    }
+
+    #[test]
+    fn test_ack_tracking_sample_from_oldest_cumulative() {
+        let mut s = socket_established();
+        // Old packet sent at 0 ms, newest packet sent at 99 ms; one aggregated ACK at 100 ms.
+        s.packet_tracker.push_back(sent_packet(1000, 1000, 0));
+        s.packet_tracker.push_back(sent_packet(2000, 1000, 99));
+
+        let rs = s.process_ack_tracking(Instant::from_millis(100), &ack_repr(3000, None));
+
+        // 2000 bytes over the oldest packet's 100 ms interval. Sampling the newest
+        // packet (1 ms interval) would report 2_000_000 B/s.
+        assert_eq!(rs.delivery_rate, 20_000);
+        assert_eq!(rs.interval, Duration::from_millis(100));
+        assert!(s.packet_tracker.is_empty());
+        assert_eq!(s.delivered, 2000);
+    }
+
+    #[test]
+    fn test_ack_tracking_sample_from_oldest_sack() {
+        let mut s = socket_established();
+        // The hole at 1000..2000 stays unacked; the two SACKed packets are retired.
+        s.packet_tracker.push_back(sent_packet(1000, 1000, 0));
+        s.packet_tracker.push_back(sent_packet(2000, 1000, 0));
+        s.packet_tracker.push_back(sent_packet(3000, 1000, 99));
+
+        let rs = s.process_ack_tracking(
+            Instant::from_millis(100),
+            &ack_repr(1000, Some((2000, 4000))),
+        );
+
+        assert_eq!(rs.delivery_rate, 20_000);
+        assert_eq!(rs.interval, Duration::from_millis(100));
+        assert_eq!(s.packet_tracker.len(), 1);
+        assert_eq!(s.delivered, 2000);
     }
 }
