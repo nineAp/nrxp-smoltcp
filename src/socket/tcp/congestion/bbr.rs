@@ -239,7 +239,10 @@ impl Bbr {
         }
         // u128 for the intermediate product: at bw ≈ 10 Gbit/s (1.25e9 bytes/s)
         // and rtt ≈ 1_000_000 µs it reaches ~1.25e15.
-        let bdp = (bw as u128 * rtt_micros as u128 / 1_000_000) as usize;
+        // Saturate instead of truncating: on a 32-bit target (armv7/x86 Android) a
+        // plain `as usize` wraps, and a huge BtlBw from a microsecond-interval sample
+        // on a local virtual link would then turn into a tiny, garbage BDP.
+        let bdp = (bw as u128 * rtt_micros as u128 / 1_000_000).min(usize::MAX as u128) as usize;
         bdp.max(self.mss * 4)
     }
 
@@ -248,7 +251,8 @@ impl Bbr {
         let max_bw = self.btlbw.get();
 
         // pacing_gain is scaled relative to BBR_UNIT = 1024, so >> 10 undoes it.
-        self.pacing_rate = (self.pacing_gain * max_bw) >> 10;
+        self.pacing_rate =
+            ((self.pacing_gain as u128 * max_bw as u128) >> 10).min(u64::MAX as u128) as u64;
 
         match self.state {
             BbrState::ProbeRtt => {
@@ -258,7 +262,8 @@ impl Bbr {
             }
             _ => {
                 // cwnd_gain is in the same 1024 base, so >> 10 undoes it.
-                let target = (self.cwnd_gain as usize * self.get_bdp()) >> 10;
+                let target = ((self.cwnd_gain as u128 * self.get_bdp() as u128) >> 10)
+                    .min(usize::MAX as u128) as usize;
                 self.cwnd = target.max(self.mss * 4);
             }
         }
@@ -674,5 +679,22 @@ mod tests {
             pr > 1_000_000 && pr < 10_000_000,
             "pacing_rate={pr} is out of a plausible range"
         );
+    }
+
+    // A huge BtlBw (microsecond-interval sample on a local link) must not overflow
+    // the BDP / cwnd / pacing arithmetic.
+    #[test]
+    fn test_huge_btlbw_does_not_overflow() {
+        let mut bbr = Bbr::new();
+        bbr.set_tunnel_rtt_override(Some(Duration::from_millis(500)));
+        let sample = RateSample {
+            delivery_rate: u64::MAX / 3,
+            rtt: Some(Duration::from_millis(1)),
+            ..Default::default()
+        };
+        bbr.on_ack_with_rate(Instant::from_millis(0), 1460, &Default::default(), sample);
+        assert!(bbr.get_bdp() >= bbr.mss * 4);
+        assert!(bbr.window() >= bbr.mss * 4);
+        let _ = bbr.pacing_rate();
     }
 }

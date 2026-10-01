@@ -2826,6 +2826,9 @@ impl Socket {
             // so BtlBw never left 0 and cwnd stayed at its 4*MSS floor.
             let interval_micros = (now - delivered_time_at_send).total_micros();
             if interval_micros >= 1 {
+                // Floor the interval at 20 us: below that the clock/poll granularity
+                // dominates, and one sample would claim terabytes per second.
+                let interval_micros = interval_micros.max(20);
                 let delivered_delta = self.delivered - delivered_at_send;
                 rate_sample.delivery_rate =
                     (delivered_delta as f64 / interval_micros as f64 * 1_000_000.0) as u64;
@@ -2844,10 +2847,17 @@ impl Socket {
         if bdp == 0 {
             return false;
         }
-        let target = (bdp * 2).clamp(65536, 2 * 1024 * 1024);
+        let target = bdp.saturating_mul(2).clamp(65536, 2 * 1024 * 1024);
         let mut window_increased = false;
 
-        if target > self.rx_buffer.capacity() {
+        // Grow only a buffer that is actually filling up. With fast rate samples on a
+        // local virtual link the BDP is huge for EVERY connection, so growing on the
+        // BDP alone gave each one (including tiny requests) 2 MB + 2 MB at the first
+        // ACK; with many connections that is hundreds of MB and pure allocation churn.
+        let rx_busy = self.rx_buffer.len() * 2 > self.rx_buffer.capacity();
+        let tx_busy = self.tx_buffer.len() * 2 > self.tx_buffer.capacity();
+
+        if target > self.rx_buffer.capacity() && rx_busy {
             tcp_trace!(
                 "BBR Scaling: RX {} -> {}",
                 self.rx_buffer.capacity(),
@@ -2865,7 +2875,7 @@ impl Socket {
             self.rx_buffer.resize(target); // resize will not go below `length`
         }
 
-        if target > self.tx_buffer.capacity() {
+        if target > self.tx_buffer.capacity() && tx_busy {
             tcp_trace!(
                 "BBR Scaling: TX {} -> {}",
                 self.tx_buffer.capacity(),
