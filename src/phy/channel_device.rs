@@ -14,8 +14,14 @@ unbounded buffering.
 * **TX (smoltcp → external):** smoltcp pushes outgoing packets via the standard
   [`TxToken`] mechanism. They accumulate in a bounded TX queue. The caller
   drains them via [`ChannelDevice::pop_tx`] after each poll and forwards them
-  to the OS device. If the TX queue is full a packet is silently dropped; TCP
-  will retransmit, and the queue fills only on extreme burst.
+  to the OS device. While the TX queue is full [`Device::transmit`] returns
+  `None` — the exact "device exhausted" signal smoltcp understands: it stops
+  emitting for this poll and leaves the data in the socket's send buffer, to be
+  sent after the queue drains. Packets are never dropped inside the device. (They
+  used to be: a burst larger than the queue was silently discarded *after* the
+  TCP state machine had already counted the segments as sent, which turned a
+  local queue overflow into loss recovery — dup-ACK storms, backed-off RTOs and
+  stalled downloads on exactly the fastest links.)
 */
 
 use std::collections::VecDeque;
@@ -100,20 +106,24 @@ impl Device for ChannelDevice {
     type TxToken<'a> = ChannelTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // The RX token comes with a TX token for the reply smoltcp may owe (RST, ACK
+        // of a probe). With no room for it, leave the packet queued for the next
+        // poll instead of consuming it and losing the reply.
+        if self.tx.len() >= self.tx_cap {
+            return None;
+        }
         self.rx.pop_front().map(|pkt| {
-            let tx_token = ChannelTxToken {
-                tx: &mut self.tx,
-                cap: self.tx_cap,
-            };
+            let tx_token = ChannelTxToken { tx: &mut self.tx };
             (ChannelRxToken(pkt), tx_token)
         })
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(ChannelTxToken {
-            tx: &mut self.tx,
-            cap: self.tx_cap,
-        })
+        // Device exhausted: smoltcp stops emitting and keeps the data queued.
+        if self.tx.len() >= self.tx_cap {
+            return None;
+        }
+        Some(ChannelTxToken { tx: &mut self.tx })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -138,7 +148,6 @@ impl RxToken for ChannelRxToken {
 
 pub struct ChannelTxToken<'a> {
     tx: &'a mut VecDeque<Vec<u8>>,
-    cap: usize,
 }
 
 impl TxToken for ChannelTxToken<'_> {
@@ -148,16 +157,53 @@ impl TxToken for ChannelTxToken<'_> {
     {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf);
-        if self.tx.len() < self.cap {
-            self.tx.push_back(buf);
-        }
-        // If TX queue is full the packet is silently dropped.
-        // TCP will retransmit; UDP is best-effort anyway.
+        // Tokens are only handed out while there is room (`transmit`/`receive`), so
+        // this never grows the queue past its capacity in practice; the push is
+        // unconditional because a packet smoltcp has already accounted for must
+        // never be lost here.
+        self.tx.push_back(buf);
         result
     }
 }
 
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(tx_cap: usize) -> ChannelDevice {
+        ChannelDevice::new(ip_tun_capabilities(1450), 8, tx_cap)
+    }
+
+    #[test]
+    fn transmit_reports_exhaustion_instead_of_dropping() {
+        let mut d = dev(2);
+        let now = Instant::from_millis(0);
+        for i in 0..2u8 {
+            d.transmit(now).expect("room").consume(1, |b| b[0] = i);
+        }
+        assert!(d.transmit(now).is_none(), "full queue must refuse new tokens");
+        // Nothing was lost, and order is preserved.
+        assert_eq!(d.pop_tx(), Some(vec![0]));
+        assert_eq!(d.pop_tx(), Some(vec![1]));
+        // Draining frees the room again.
+        assert!(d.transmit(now).is_some());
+    }
+
+    #[test]
+    fn receive_waits_while_replies_would_not_fit() {
+        let mut d = dev(1);
+        let now = Instant::from_millis(0);
+        d.push_rx(vec![9]);
+        d.transmit(now).unwrap().consume(1, |_| {});
+        assert!(d.receive(now).is_none(), "no TX room: keep the packet queued");
+        assert_eq!(d.rx_len(), 1);
+        d.pop_tx();
+        let (rx, _tx) = d.receive(now).expect("room again");
+        rx.consume(|p| assert_eq!(p, &[9]));
+    }
+}
 
 /// Helper: returns a [`DeviceCapabilities`] suitable for an IP-mode TUN device.
 pub fn ip_tun_capabilities(mtu: usize) -> DeviceCapabilities {

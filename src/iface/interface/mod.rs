@@ -116,6 +116,10 @@ pub struct Interface {
     pub(crate) inner: InterfaceInner,
     fragments: FragmentsBuffer,
     fragmenter: Fragmenter,
+    /// Socket slot where the next egress pass starts. When the device runs out of
+    /// room mid-pass this is the socket that did not get its turn, so the sockets
+    /// that follow it in the set are not starved by the ones in front of it.
+    egress_cursor: usize,
 }
 
 /// The device independent part of an Ethernet network interface.
@@ -257,6 +261,7 @@ impl Interface {
                 reassembly_timeout: Duration::from_secs(60),
             },
             fragmenter: Fragmenter::new(),
+            egress_cursor: 0,
             inner: InterfaceInner {
                 now,
                 caps,
@@ -710,7 +715,9 @@ impl Interface {
         }
 
         let mut result = PollResult::None;
-        for item in sockets.items_mut() {
+        // Resume where the previous pass ran out of device room (see `egress_cursor`).
+        let mut stopped_at = None;
+        for (slot, item) in sockets.items_mut_from(self.egress_cursor) {
             if !item
                 .meta
                 .egress_permitted(self.inner.now, |ip_addr| self.inner.has_neighbor(&ip_addr))
@@ -798,7 +805,11 @@ impl Interface {
             };
 
             match result {
-                Err(EgressError::Exhausted) => break, // Device buffer full.
+                Err(EgressError::Exhausted) => {
+                    // Device buffer full: this socket is first in line next time.
+                    stopped_at = Some(slot);
+                    break;
+                }
                 Err(EgressError::Dispatch) => {
                     // `NeighborCache` already takes care of rate limiting the neighbor discovery
                     // requests from the socket. However, without an additional rate limiting
@@ -812,6 +823,9 @@ impl Interface {
                 Ok(()) => {}
             }
         }
+        // A full pass starts over from the first socket; an interrupted one resumes at
+        // the socket that ran out of room.
+        self.egress_cursor = stopped_at.unwrap_or(0);
         result
     }
 }

@@ -148,4 +148,24 @@ impl<'a> SocketSet<'a> {
     pub(crate) fn items_mut(&mut self) -> impl Iterator<Item = &mut Item<'a>> + '_ {
         self.sockets.iter_mut().filter_map(|x| x.inner.as_mut())
     }
+
+    /// Iterate every socket as `(slot, item)`, starting at slot `start` and wrapping
+    /// around. Egress uses it to resume where the previous poll ran out of device
+    /// room, so one pass over the sockets never favours the same ones.
+    pub(crate) fn items_mut_from(
+        &mut self,
+        start: usize,
+    ) -> impl Iterator<Item = (usize, &mut Item<'a>)> + '_ {
+        let start = if self.sockets.is_empty() {
+            0
+        } else {
+            start % self.sockets.len()
+        };
+        let (head, tail) = self.sockets.split_at_mut(start);
+        tail.iter_mut()
+            .enumerate()
+            .map(move |(i, x)| (start + i, x))
+            .chain(head.iter_mut().enumerate())
+            .filter_map(|(slot, x)| x.inner.as_mut().map(|item| (slot, item)))
+    }
 }

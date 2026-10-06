@@ -50,6 +50,70 @@ impl TxToken for MockTxToken {
     }
 }
 
+/// When the device runs out of room mid-pass, the next pass must start at the socket
+/// that did not get its turn. Always starting from the first socket let the sockets in
+/// front monopolise a saturated device and starve the rest (half of the streams of a
+/// speedtest finished, the others got a few percent of the bandwidth).
+#[cfg(all(
+    feature = "socket-udp",
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "std"
+))]
+#[test]
+fn test_egress_resumes_at_the_socket_that_ran_out_of_room() {
+    use crate::phy::{ChannelDevice, ip_tun_capabilities};
+    use crate::socket::udp;
+    use crate::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Packet, UdpPacket};
+
+    let mut device = ChannelDevice::new(ip_tun_capabilities(1450), 8, 2);
+    let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, Instant::ZERO);
+    iface.update_ip_addrs(|addrs| {
+        addrs
+            .push(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24))
+            .unwrap();
+    });
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let mut handles = Vec::new();
+    for i in 0..4u16 {
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 16]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 64]);
+        let mut socket = udp::Socket::new(rx, tx);
+        socket.bind(1000 + i).unwrap();
+        // Two datagrams queued on every socket: enough for two full passes.
+        for _ in 0..2 {
+            socket
+                .send_slice(
+                    b"x",
+                    IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2)), 2000 + i),
+                )
+                .unwrap();
+        }
+        handles.push(sockets.add(socket));
+    }
+
+    let dst_ports = |device: &mut ChannelDevice| {
+        let mut ports = Vec::new();
+        while let Some(pkt) = device.pop_tx() {
+            let ip = Ipv4Packet::new_unchecked(&pkt[..]);
+            let udp = UdpPacket::new_unchecked(ip.payload());
+            ports.push(udp.dst_port());
+        }
+        ports
+    };
+
+    let now = Instant::from_millis(1);
+    // The device has room for two packets: sockets 0 and 1 are served, 2 is next in line.
+    iface.poll(now, &mut device, &mut sockets);
+    assert_eq!(dst_ports(&mut device), vec![2000, 2001]);
+    // The next pass must pick up at socket 2, not at socket 0.
+    iface.poll(now, &mut device, &mut sockets);
+    assert_eq!(dst_ports(&mut device), vec![2002, 2003]);
+    iface.poll(now, &mut device, &mut sockets);
+    assert_eq!(dst_ports(&mut device), vec![2000, 2001]);
+}
+
 #[test]
 #[should_panic(expected = "The hardware address does not match the medium of the interface.")]
 #[cfg(all(feature = "medium-ip", feature = "medium-ethernet", feature = "alloc"))]
