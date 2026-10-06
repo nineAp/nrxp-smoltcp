@@ -1258,6 +1258,34 @@ impl Socket {
         self.congestion_controller.inner().get_estimated_bdp()
     }
 
+    /// Compact one-line dump of the sender state (window, in-flight, timers,
+    /// pacing and congestion controller). Meant for periodic diagnostics: it
+    /// allocates, so keep it off the packet path.
+    pub fn diag_summary(&self, now: Instant) -> String {
+        let rel = |t: Instant| (t - now).total_millis();
+        let timer = match self.timer {
+            Timer::Idle { .. } => "idle".to_string(),
+            Timer::Retransmit { expires_at } => format!("rtx@{}ms", rel(expires_at)),
+            Timer::FastRetransmit => "fast-rtx".to_string(),
+            Timer::ZeroWindowProbe { expires_at, .. } => format!("zwp@{}ms", rel(expires_at)),
+            Timer::Close { expires_at } => format!("close@{}ms", rel(expires_at)),
+        };
+        format!(
+            "{:?} txq={}KB inflight={}KB rwnd={}KB rto={}ms srtt={}ms timer={} pace@{}ms dupack={} rx_ts={:?} | {}",
+            self.state,
+            self.tx_buffer.len() / 1024,
+            (self.remote_last_seq - self.local_seq_no) / 1024,
+            self.remote_win_len / 1024,
+            self.rtte.rto,
+            self.rtte.srtt,
+            timer,
+            rel(self.pacing_timer),
+            self.local_rx_dup_acks,
+            self.remote_last_ts.map(|t| rel(t)),
+            self.congestion_controller.inner().describe(),
+        )
+    }
+
     /// Start listening on the given endpoint.
     ///
     /// This function returns `Err(Error::InvalidState)` if the socket was already open

@@ -40,6 +40,12 @@ pub(super) trait Controller {
     fn get_estimated_bdp(&self) -> usize {
         0
     }
+
+    /// One-line human-readable controller state, for diagnostics only.
+    fn describe(&self) -> String {
+        String::new()
+    }
+
     fn on_retransmit(&mut self, now: Instant) {}
 
     fn on_duplicate_ack(&mut self, now: Instant) {}

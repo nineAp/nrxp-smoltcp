@@ -334,6 +334,20 @@ impl Controller for Bbr {
         self.get_bdp()
     }
 
+    fn describe(&self) -> String {
+        format!(
+            "bbr={:?} btlbw={}KB/s rtprop={}us ovr={:?}ms inflight={}KB cwnd={}KB pace={}KB/s round={}",
+            self.state,
+            self.btlbw.get() / 1024,
+            self.rtprop.get(),
+            self.tunnel_rtt_override.map(|d| d.millis()),
+            self.inflight / 1024,
+            self.cwnd / 1024,
+            self.pacing_rate / 1024,
+            self.round_count,
+        )
+    }
+
     fn on_ack(
         &mut self,
         _now: Instant,
