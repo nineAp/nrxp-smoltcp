@@ -1,5 +1,5 @@
 [package]
-name = "nxrp-smoltcp"
+name = "nrxp-smoltcp"
 version = "0.13.0"
 edition = "2024"
 rust-version = "1.91"
@@ -8,8 +8,8 @@ authors = [
     "whitequark <whitequark@whitequark.org>",
 ]
 description = "A fork of the smoltcp TCP/IP stack, adapted to run as the transport core of a userspace tunnel client: BBR congestion control, BDP-sized dynamic socket buffers, AQM, and an async-friendly virtual device."
-homepage = "https://github.com/nineAp/nxrp-smoltcp"
-repository = "https://github.com/nineAp/nxrp-smoltcp.git"
+homepage = "https://github.com/nineAp/nrxp-smoltcp"
+repository = "https://github.com/nineAp/nrxp-smoltcp.git"
 readme = "README.md"
 keywords = ["ip", "tcp", "udp", "ethernet", "network"]
 categories = ["embedded", "network-programming"]
@@ -21,7 +21,7 @@ publish = false
 autoexamples = false
 
 # The library target keeps the upstream name, so the fork stays a drop-in
-# replacement: consumers write `smoltcp = { package = "nxrp-smoltcp", git = ... }`
+# replacement: consumers write `smoltcp = { package = "nrxp-smoltcp", git = ... }`
 # and their `use smoltcp::...` paths are unchanged.
 [lib]
 name = "smoltcp"

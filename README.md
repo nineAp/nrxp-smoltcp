@@ -1,10 +1,10 @@
-# nxrp-smoltcp
+# nrxp-smoltcp
 
 [![License](https://img.shields.io/badge/license-0BSD-blue.svg)](LICENSE-0BSD.txt)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org)
 [![based on smoltcp](https://img.shields.io/badge/based%20on-smoltcp-informational.svg)](https://github.com/smoltcp-rs/smoltcp)
 
-_nxrp-smoltcp_ is a fork of [smoltcp](https://github.com/smoltcp-rs/smoltcp), the standalone,
+_nrxp-smoltcp_ is a fork of [smoltcp](https://github.com/smoltcp-rs/smoltcp), the standalone,
 event-driven TCP/IP stack originally built for bare-metal, real-time systems. This fork keeps
 the upstream protocol implementation and its no-heap, no-macro-magic design philosophy, and adds
 a set of changes aimed at running smoltcp's TCP socket as the transport core of a **userspace
@@ -213,10 +213,10 @@ This fork is not published to crates.io. Depend on it directly from git:
 
 ```toml
 [dependencies]
-smoltcp = { package = "nxrp-smoltcp", git = "https://github.com/nineAp/nxrp-smoltcp", default-features = false, features = ["log"] }
+smoltcp = { package = "nrxp-smoltcp", git = "https://github.com/nineAp/nrxp-smoltcp", default-features = false, features = ["log"] }
 ```
 
-The package is named `nxrp-smoltcp`, but its library target keeps the name `smoltcp`.
+The package is named `nrxp-smoltcp`, but its library target keeps the name `smoltcp`.
 Renaming the dependency back to `smoltcp` as above leaves existing `use smoltcp::...`
 paths untouched.
 
